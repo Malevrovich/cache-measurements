@@ -10,8 +10,6 @@ Measured on Apple M3 Pro running macOS:
 | L1 line size | 64 bytes |
 | Associativity | 8 ways |
 
-Full output: [result.txt](result.txt). Timing results can vary between runs.
-
 ## Build and run
 
 Requires CMake 3.16 or later and a C++20 compiler.

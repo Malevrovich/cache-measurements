@@ -1,3 +1,0 @@
-L1D capacity: 128 KiB
-L1 line size: 64 bytes
-Associativity: 8
