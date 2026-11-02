@@ -1,6 +1,8 @@
 #include "experiments.h"
 
 #include <algorithm>
+#include <array>
+#include <iostream>
 #include <stdexcept>
 #include <vector>
 
@@ -70,11 +72,20 @@ std::size_t RequiredMemoryBytes() {
 }
 
 CacheGeometry MeasureCacheGeometry(Node* memory) {
+  constexpr std::size_t kFirstDiagnosticCount = 6;
+  constexpr std::size_t kLastDiagnosticCount = 12;
+  constexpr std::size_t kDiagnosticSamples =
+      kLastDiagnosticCount - kFirstDiagnosticCount + 1;
+
   CacheGeometry candidate{};
   int confirming_strides = 0;
 
+  std::cerr << "stride_bytes,n,control_ns,strided_ns,ratio\n";
+
   for (std::size_t stride = sizeof(Node); stride <= kMaxConflictStride;
        stride *= 2) {
+    std::array<double, kDiagnosticSamples> control_latencies{};
+    std::array<double, kDiagnosticSamples> strided_latencies{};
     std::size_t first_conflicting_count = 0;
     bool previous_was_slow = false;
 
@@ -84,14 +95,30 @@ CacheGeometry MeasureCacheGeometry(Node* memory) {
       const double strided_latency =
           MeasureOffsets(memory, MakeOffsets(count, stride));
 
+      if (count >= kFirstDiagnosticCount && count <= kLastDiagnosticCount) {
+        const auto index = count - kFirstDiagnosticCount;
+        control_latencies[index] = control_latency;
+        strided_latencies[index] = strided_latency;
+      }
+
       const bool is_slow =
           strided_latency / control_latency > kTransitionThreshold;
-      if (is_slow && previous_was_slow) {
+      if (first_conflicting_count == 0 && is_slow && previous_was_slow) {
         first_conflicting_count = count - 1;
-        break;
       }
 
       previous_was_slow = is_slow;
+
+      if (first_conflicting_count != 0 && count >= kLastDiagnosticCount) {
+        break;
+      }
+    }
+
+    for (std::size_t index = 0; index < kDiagnosticSamples; ++index) {
+      std::cerr << stride << ',' << index + kFirstDiagnosticCount << ','
+                << control_latencies[index] << ',' << strided_latencies[index]
+                << ',' << strided_latencies[index] / control_latencies[index]
+                << '\n';
     }
 
     if (first_conflicting_count < 2) {
