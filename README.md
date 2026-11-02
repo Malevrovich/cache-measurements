@@ -23,6 +23,9 @@ Run with `taskset -c 0`.
 | L1 line size | 64 bytes | 64 bytes |
 | Associativity | 9 ways | 8 ways |
 
+The measured 36 KiB looked suspicious because `lscpu` reported 32 KiB
+of L1D per instance (96 KiB across 3 instances).
+
 The original detector missed the initial slowdown at 9 nodes because it
 was below the 1.5 threshold. It detected the slowdown at 10 nodes and
 reported 9 ways, giving 36 KiB instead of 32 KiB.
