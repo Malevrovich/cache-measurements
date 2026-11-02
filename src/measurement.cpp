@@ -7,16 +7,17 @@
 #include <vector>
 
 namespace cache_probe {
-namespace {
 
 Node* last_visited_node = nullptr;
 
+namespace {
+
 double MeasureRingLatency(Node* current_node, int steps, int repeats) {
+  std::vector<double> latencies(repeats);
+
   for (int i = 0; i < steps; ++i) {
     current_node = current_node->next;
   }
-
-  std::vector<double> latencies;
 
   for (int repeat = 0; repeat < repeats; ++repeat) {
     const auto start_time = std::chrono::steady_clock::now();
@@ -25,14 +26,13 @@ double MeasureRingLatency(Node* current_node, int steps, int repeats) {
       current_node = current_node->next;
     }
 
-    const auto finish_time = std::chrono::steady_clock::now();
-
     last_visited_node = current_node;
+    const auto finish_time = std::chrono::steady_clock::now();
 
     const double elapsed_ns =
         std::chrono::duration<double, std::nano>(finish_time - start_time)
             .count();
-    latencies.push_back(elapsed_ns / steps);
+    latencies[repeat] = elapsed_ns / steps;
   }
 
   std::sort(latencies.begin(), latencies.end());
