@@ -6,15 +6,15 @@
 
 namespace cache_probe {
 
-struct CacheGeometry {
-  std::size_t associativity;
-  std::size_t conflict_stride;
-};
-
 std::size_t RequiredMemoryBytes();
 
-CacheGeometry MeasureCacheGeometry(Node* memory, bool debug = false);
+std::size_t MeasureCacheCapacity(Node* memory, std::size_t line_size,
+                                 bool debug = false);
 
-std::size_t MeasureCacheLineSize(Node* memory);
+std::size_t MeasureCacheAssociativity(Node* memory, std::size_t capacity_bytes,
+                                      std::size_t line_size,
+                                      bool debug = false);
+
+std::size_t MeasureCacheLineSize(Node* memory, bool debug = false);
 
 }

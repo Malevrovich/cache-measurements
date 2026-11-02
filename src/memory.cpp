@@ -8,7 +8,7 @@
 namespace cache_probe {
 
 AlignedBuffer::AlignedBuffer(std::size_t byte_count) {
-  constexpr std::size_t kAlignment = 1024 * 1024;
+  constexpr std::size_t kAlignment = 4 * 1024 * 1024;
   static_assert(kAlignment % sizeof(Node) == 0);
 
   constexpr std::size_t kExtraNodes = kAlignment / sizeof(Node);

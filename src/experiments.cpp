@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <iostream>
+#include <numeric>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -13,50 +15,141 @@ namespace {
 
 constexpr double kConflictOnsetThreshold = 1.2;
 constexpr double kConflictConfirmationThreshold = 1.5;
-constexpr std::size_t kMaxConflictStride = 1024 * 1024;
+constexpr std::size_t kControlRegionBytes = 4096;
+constexpr std::size_t kCapacityStepBytes = 4096;
+constexpr std::size_t kCapacityResolutionBytes = 1024;
+constexpr double kCapacityThreshold = 1.2;
+constexpr std::size_t kMaxCapacityBytes = 1024 * 1024;
 constexpr std::size_t kMaxConflictNodes = 64;
-constexpr int kConfirmingStrides = 3;
-constexpr std::size_t kMinCacheStride = 4 * sizeof(Node);
-constexpr std::size_t kMaxCacheStride = 1024;
-constexpr std::size_t kMaxCacheNodes = 8192;
+constexpr std::size_t kPatternTrials = 5;
+constexpr int kProbeSteps = 2097152;
+constexpr int kProbeRepeats = 3;
+constexpr std::size_t kLineRegionBytes = 4 * 1024 * 1024;
+constexpr std::size_t kLineTileBytes = 512;
 
-std::size_t FindWorkingSetBoundary(Node* memory, std::size_t stride,
-                                   std::size_t max_nodes) {
-  constexpr std::size_t kBaselineSamples = 5;
-  std::vector<double> baseline;
-  double threshold = 0;
-  std::size_t previous_count = 0;
-  std::size_t boundary = 0;
-  int consecutive_slow = 0;
+struct LatencyPair {
+  double control;
+  double measured;
+};
 
-  for (std::size_t count = 4; count <= max_nodes;
-       count += count < 256 ? 4 : (count < 1024 ? 16 : 64)) {
-    const double latency =
-        MeasureOffsets(memory, MakeOffsets(count, stride), 65536, 3);
+LatencyPair MeasurePatternPair(Node* memory,
+                               const std::vector<std::size_t>& control_offsets,
+                               const std::vector<std::size_t>& measured_offsets,
+                               std::uint32_t seed, bool control_first) {
+  LatencyPair result{};
 
-    if (baseline.size() < kBaselineSamples) {
-      baseline.push_back(latency);
-      if (baseline.size() == kBaselineSamples) {
-        std::sort(baseline.begin(), baseline.end());
-        threshold = baseline[baseline.size() / 2] * 1.35;
+  if (control_first) {
+    result.control = MeasureOffsets(memory, control_offsets, kProbeSteps,
+                                    kProbeRepeats, seed);
+    result.measured = MeasureOffsets(memory, measured_offsets, kProbeSteps,
+                                     kProbeRepeats, seed);
+  } else {
+    result.measured = MeasureOffsets(memory, measured_offsets, kProbeSteps,
+                                     kProbeRepeats, seed);
+    result.control = MeasureOffsets(memory, control_offsets, kProbeSteps,
+                                    kProbeRepeats, seed);
+  }
+
+  return result;
+}
+
+double MeasureCapacityRatio(Node* memory, std::size_t bytes,
+                            std::size_t line_size, bool debug) {
+  const auto control_offsets =
+      MakeOffsets(kControlRegionBytes / line_size, line_size);
+  const auto offsets = MakeOffsets(bytes / line_size, line_size);
+  std::array<LatencyPair, kPatternTrials> timings{};
+  std::array<double, kPatternTrials> ratios{};
+
+  for (std::size_t trial = 0; trial < kPatternTrials; ++trial) {
+    const auto seed = static_cast<std::uint32_t>(trial);
+    timings[trial] = MeasurePatternPair(memory, control_offsets, offsets, seed,
+                                        trial % 2 == 0);
+    ratios[trial] = timings[trial].measured / timings[trial].control;
+  }
+
+  if (debug) {
+    for (std::size_t trial = 0; trial < kPatternTrials; ++trial) {
+      std::cerr << "capacity," << bytes << ',' << offsets.size() << ','
+                << trial + 1 << ',' << timings[trial].control << ','
+                << timings[trial].control << ',' << timings[trial].measured
+                << ',' << ratios[trial] << '\n';
+    }
+  }
+
+  std::sort(ratios.begin(), ratios.end());
+  return ratios[ratios.size() / 2];
+}
+
+std::size_t FindConflictBoundary(Node* memory, std::size_t stride,
+                                 std::size_t max_nodes, std::size_t line_size,
+                                 std::size_t trial_group, bool debug) {
+  const std::size_t control_region = std::min(stride, kControlRegionBytes);
+  const auto baseline_offsets =
+      MakeOffsets(kControlRegionBytes / line_size, line_size);
+  std::array<double, kPatternTrials> baseline_latencies{};
+  for (std::size_t trial = 0; trial < kPatternTrials; ++trial) {
+    const auto seed =
+        static_cast<std::uint32_t>(trial_group * kPatternTrials + trial);
+    baseline_latencies[trial] = MeasureOffsets(
+        memory, baseline_offsets, kProbeSteps, kProbeRepeats, seed);
+  }
+
+  std::size_t transition_start = 0;
+  bool previous_was_slow = false;
+
+  for (std::size_t count = 1; count <= max_nodes; ++count) {
+    std::array<LatencyPair, kPatternTrials> timings{};
+    std::array<double, kPatternTrials> relative_costs{};
+
+    for (std::size_t trial = 0; trial < kPatternTrials; ++trial) {
+      const std::size_t common_offset = (trial * 7 + trial_group * 11) %
+                                        (control_region / line_size) *
+                                        line_size;
+      auto conflict_offsets = MakeOffsets(count, stride);
+      auto control_offsets = conflict_offsets;
+
+      for (std::size_t i = 0; i < count; ++i) {
+        conflict_offsets[i] += common_offset;
+        control_offsets[i] += (common_offset + i * line_size) % control_region;
       }
 
-      previous_count = count;
-      continue;
+      const auto seed =
+          static_cast<std::uint32_t>(trial_group * kPatternTrials + trial);
+      timings[trial] =
+          MeasurePatternPair(memory, control_offsets, conflict_offsets, seed,
+                             (trial + trial_group) % 2 == 0);
+      relative_costs[trial] =
+          1.0 + (timings[trial].measured - timings[trial].control) /
+                    baseline_latencies[trial];
     }
 
-    if (latency > threshold) {
-      if (consecutive_slow == 0) {
-        boundary = previous_count;
+    if (debug) {
+      for (std::size_t trial = 0; trial < kPatternTrials; ++trial) {
+        std::cerr << "associativity," << stride << ',' << count << ','
+                  << trial_group * kPatternTrials + trial + 1 << ','
+                  << baseline_latencies[trial] << ',' << timings[trial].control
+                  << ',' << timings[trial].measured << ','
+                  << relative_costs[trial] << '\n';
       }
-      if (++consecutive_slow == 3) {
-        return boundary;
+    }
+
+    std::sort(relative_costs.begin(), relative_costs.end());
+    const double relative_cost = relative_costs[relative_costs.size() / 2];
+    if (relative_cost > kConflictOnsetThreshold) {
+      if (transition_start == 0) {
+        transition_start = count;
       }
     } else {
-      consecutive_slow = 0;
+      transition_start = 0;
     }
 
-    previous_count = count;
+    const bool is_slow = relative_cost > kConflictConfirmationThreshold;
+    if (is_slow && previous_was_slow) {
+      return transition_start - 1;
+    }
+
+    previous_was_slow = is_slow;
   }
 
   return 0;
@@ -65,156 +158,174 @@ std::size_t FindWorkingSetBoundary(Node* memory, std::size_t stride,
 }
 
 std::size_t RequiredMemoryBytes() {
-  const std::size_t conflict_bytes = kMaxConflictStride * kMaxConflictNodes;
-  const std::size_t line_bytes =
-      (kMaxCacheStride + kMaxCacheStride / 2) * kMaxCacheNodes;
-
-  return std::max(conflict_bytes, line_bytes);
+  const std::size_t conflict_bytes = kMaxCapacityBytes * kMaxConflictNodes;
+  return std::max(conflict_bytes, kLineRegionBytes);
 }
 
-CacheGeometry MeasureCacheGeometry(Node* memory, bool debug) {
-  constexpr std::size_t kFirstDiagnosticCount = 6;
-  constexpr std::size_t kLastDiagnosticCount = 12;
-  constexpr std::size_t kDiagnosticSamples =
-      kLastDiagnosticCount - kFirstDiagnosticCount + 1;
-
-  CacheGeometry candidate{};
-  int confirming_strides = 0;
-
-  if (debug) {
-    std::cerr << "stride_bytes,n,control_ns,strided_ns,ratio\n";
+std::size_t MeasureCacheCapacity(Node* memory, std::size_t line_size,
+                                 bool debug) {
+  if (line_size < sizeof(Node) || line_size > kCapacityResolutionBytes ||
+      kCapacityResolutionBytes % line_size != 0) {
+    throw std::invalid_argument("Invalid line size for the capacity scan.");
   }
 
-  for (std::size_t stride = sizeof(Node); stride <= kMaxConflictStride;
-       stride *= 2) {
-    std::array<double, kDiagnosticSamples> control_latencies{};
-    std::array<double, kDiagnosticSamples> strided_latencies{};
-    std::size_t transition_start = 0;
-    std::size_t first_conflicting_count = 0;
-    bool previous_was_slow = false;
+  std::size_t boundary_bytes = 0;
+  int consecutive_slow = 0;
 
-    for (std::size_t count = 1; count <= kMaxConflictNodes; ++count) {
-      const double control_latency =
-          MeasureOffsets(memory, MakeOffsets(count, sizeof(Node)));
-      const double strided_latency =
-          MeasureOffsets(memory, MakeOffsets(count, stride));
-
-      if (debug && count >= kFirstDiagnosticCount &&
-          count <= kLastDiagnosticCount) {
-        const auto index = count - kFirstDiagnosticCount;
-        control_latencies[index] = control_latency;
-        strided_latencies[index] = strided_latency;
+  for (std::size_t bytes = kCapacityStepBytes; bytes <= kMaxCapacityBytes;
+       bytes += kCapacityStepBytes) {
+    if (MeasureCapacityRatio(memory, bytes, line_size, debug) >
+        kCapacityThreshold) {
+      if (consecutive_slow == 0) {
+        boundary_bytes = bytes - kCapacityStepBytes;
       }
+      if (++consecutive_slow == 3 && boundary_bytes != 0) {
+        std::size_t fast_bytes = boundary_bytes;
+        std::size_t slow_bytes = boundary_bytes + kCapacityStepBytes;
 
-      const double ratio = strided_latency / control_latency;
-      if (ratio > kConflictOnsetThreshold) {
-        if (transition_start == 0) {
-          transition_start = count;
+        while (slow_bytes - fast_bytes > kCapacityResolutionBytes) {
+          const std::size_t middle_bytes =
+              fast_bytes + (slow_bytes - fast_bytes) / 2;
+          if (MeasureCapacityRatio(memory, middle_bytes, line_size, debug) >
+              kCapacityThreshold) {
+            slow_bytes = middle_bytes;
+          } else {
+            fast_bytes = middle_bytes;
+          }
         }
-      } else {
-        transition_start = 0;
+
+        return fast_bytes;
       }
-
-      const bool is_slow = ratio > kConflictConfirmationThreshold;
-      if (first_conflicting_count == 0 && is_slow && previous_was_slow) {
-        first_conflicting_count = transition_start;
-      }
-
-      previous_was_slow = is_slow;
-
-      if (first_conflicting_count != 0 &&
-          (!debug || count >= kLastDiagnosticCount)) {
-        break;
-      }
-    }
-
-    if (debug) {
-      for (std::size_t index = 0; index < kDiagnosticSamples; ++index) {
-        std::cerr << stride << ',' << index + kFirstDiagnosticCount << ','
-                  << control_latencies[index] << ',' << strided_latencies[index]
-                  << ',' << strided_latencies[index] / control_latencies[index]
-                  << '\n';
-      }
-    }
-
-    if (first_conflicting_count < 2) {
-      candidate = {};
-      confirming_strides = 0;
-      continue;
-    }
-
-    const auto nodes_before_conflict = first_conflicting_count - 1;
-
-    if (candidate.associativity == nodes_before_conflict) {
-      ++confirming_strides;
     } else {
-      candidate = {nodes_before_conflict, stride};
-      confirming_strides = 1;
-    }
-
-    if (confirming_strides == kConfirmingStrides) {
-      return candidate;
+      consecutive_slow = 0;
     }
   }
 
-  throw std::runtime_error("Could not find a stable L1 conflict boundary.");
+  throw std::runtime_error("Could not find a stable L1 capacity boundary.");
 }
 
-std::size_t MeasureCacheLineSize(Node* memory) {
-  std::size_t block_size = 0;
-  std::size_t candidate_block_size = 0;
-  std::size_t last_decrease_stride = 0;
+std::size_t MeasureCacheAssociativity(Node* memory, std::size_t capacity_bytes,
+                                      std::size_t line_size, bool debug) {
+  if (capacity_bytes < kCapacityStepBytes ||
+      capacity_bytes > kMaxCapacityBytes ||
+      capacity_bytes % kCapacityResolutionBytes != 0 ||
+      line_size < sizeof(Node) || line_size > kCapacityResolutionBytes ||
+      kCapacityResolutionBytes % line_size != 0) {
+    throw std::invalid_argument(
+        "Invalid cache dimensions for the associativity scan.");
+  }
 
-  for (std::size_t high_stride = kMinCacheStride;
-       high_stride <= kMaxCacheStride; high_stride *= 2) {
-    const auto original_boundary =
-        FindWorkingSetBoundary(memory, high_stride, kMaxCacheNodes);
-    const auto quarter_boundary = FindWorkingSetBoundary(
-        memory, high_stride + high_stride / 4, kMaxCacheNodes);
-    const auto half_boundary = FindWorkingSetBoundary(
-        memory, high_stride + high_stride / 2, kMaxCacheNodes);
+  std::array<std::size_t, 3> candidates{};
 
-    if (original_boundary == 0 || quarter_boundary == 0 || half_boundary == 0) {
-      candidate_block_size = 0;
-      continue;
-    }
-
-    const bool decreased = quarter_boundary < original_boundary * 0.90 &&
-                           half_boundary < original_boundary * 0.85;
-    const bool increased = quarter_boundary > original_boundary * 1.25 &&
-                           half_boundary > original_boundary * 1.25;
-
-    if (decreased) {
-      last_decrease_stride = high_stride;
-      candidate_block_size = 0;
-    } else if (increased && last_decrease_stride != 0) {
-      if (high_stride == candidate_block_size * 4) {
-        block_size = candidate_block_size;
-        break;
+  for (std::size_t attempt = 0; attempt < candidates.size(); ++attempt) {
+    for (std::size_t ways = 1; ways + 3 <= kMaxConflictNodes; ++ways) {
+      if (capacity_bytes % (ways * line_size) != 0) {
+        continue;
       }
 
-      const auto candidate = high_stride / 2;
-      if (candidate >= last_decrease_stride &&
-          candidate <= 2 * last_decrease_stride) {
-        candidate_block_size = candidate;
-      } else {
-        candidate_block_size = 0;
+      const std::size_t stride = capacity_bytes / ways;
+      const std::size_t control_region = std::min(stride, kControlRegionBytes);
+      if (stride % control_region != 0 ||
+          kControlRegionBytes % control_region != 0) {
+        continue;
       }
-    } else {
-      candidate_block_size = 0;
+
+      const std::size_t trial_group = attempt * 2;
+      if (FindConflictBoundary(memory, stride, ways + 3, line_size, trial_group,
+                               debug) != ways ||
+          FindConflictBoundary(memory, stride * 2, ways + 3, line_size,
+                               trial_group + 1, debug) != ways) {
+        continue;
+      }
+
+      candidates[attempt] = ways;
+      if (std::count(candidates.begin(), candidates.end(), ways) >= 2) {
+        return ways;
+      }
+      break;
     }
   }
 
-  if (block_size == 0) {
+  throw std::runtime_error(
+      "Could not reproduce the L1 associativity boundary.");
+}
+
+std::size_t MeasureCacheLineSize(Node* memory, bool debug) {
+  constexpr std::array<std::size_t, 6> kOffsets = {8, 16, 32, 64, 128, 256};
+  constexpr std::size_t kGroupCount = kLineRegionBytes / kLineTileBytes;
+
+  std::vector<std::size_t> groups(kGroupCount);
+  std::iota(groups.begin(), groups.end(), 0);
+  std::array<std::size_t, kOffsets.size()> tests{};
+  std::iota(tests.begin(), tests.end(), 0);
+  std::array<std::array<double, kPatternTrials>, kOffsets.size()> timings{};
+
+  for (std::size_t trial = 0; trial < kPatternTrials; ++trial) {
+    std::mt19937 random_order(static_cast<std::uint32_t>(trial));
+    std::shuffle(groups.begin(), groups.end(), random_order);
+    std::shuffle(tests.begin(), tests.end(), random_order);
+
+    for (const auto test : tests) {
+      std::vector<std::size_t> offsets;
+      offsets.reserve(kGroupCount * 2);
+      for (const auto group : groups) {
+        offsets.push_back(group * kLineTileBytes);
+        offsets.push_back(group * kLineTileBytes + kOffsets[test]);
+      }
+
+      timings[test][trial] =
+          MeasureOrderedOffsets(memory, offsets, kProbeSteps, kProbeRepeats);
+    }
+  }
+
+  std::array<double, kOffsets.size()> latencies{};
+  for (std::size_t test = 0; test < kOffsets.size(); ++test) {
+    if (debug) {
+      for (std::size_t trial = 0; trial < kPatternTrials; ++trial) {
+        const double baseline = timings[0][trial];
+        std::cerr << "line," << kOffsets[test] << ',' << kGroupCount * 2 << ','
+                  << trial + 1 << ',' << baseline << ',' << baseline << ','
+                  << timings[test][trial] << ','
+                  << timings[test][trial] / baseline << '\n';
+      }
+    }
+
+    auto samples = timings[test];
+    std::sort(samples.begin(), samples.end());
+    latencies[test] = samples[samples.size() / 2];
+  }
+
+  std::size_t candidate = 1;
+  for (std::size_t test = 2; test < kOffsets.size(); ++test) {
+    if (latencies[test] / latencies[test - 1] >
+        latencies[candidate] / latencies[candidate - 1]) {
+      candidate = test;
+    }
+  }
+
+  const double before_jump = latencies[candidate - 1];
+  if (latencies[candidate] < before_jump * 1.15 ||
+      !std::all_of(
+          latencies.begin() + candidate, latencies.end(),
+          [before_jump](double latency) {
+            return latency > before_jump * 1.10;
+          })) {
     throw std::runtime_error(
-        "Could not determine the line size from boundary transitions.");
+        "Could not find a stable L1 line-size transition.");
   }
 
-  if (block_size < 32 || block_size > 256) {
-    throw std::runtime_error("Line size is outside the experiment range.");
+  int confirming_trials = 0;
+  for (std::size_t trial = 0; trial < kPatternTrials; ++trial) {
+    if (timings[candidate][trial] > timings[candidate - 1][trial] * 1.10) {
+      ++confirming_trials;
+    }
+  }
+  if (confirming_trials < 4) {
+    throw std::runtime_error(
+        "Could not reproduce the L1 line-size transition.");
   }
 
-  return block_size;
+  return kOffsets[candidate];
 }
 
 }

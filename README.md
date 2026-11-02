@@ -40,7 +40,7 @@ cmake --build build
 ./build/l1-cache
 ```
 
-To write latency diagnostics for N = 6 through 12 to a file:
+To write line-size, capacity and associativity diagnostics to a file:
 
 ```sh
 ./build/l1-cache --debug 2> latencies.csv

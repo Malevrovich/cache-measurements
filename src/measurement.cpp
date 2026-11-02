@@ -60,17 +60,15 @@ std::vector<std::size_t> MakeOffsets(std::size_t count, std::size_t stride) {
   return result;
 }
 
-double MeasureOffsets(Node* memory, std::vector<std::size_t> offsets, int steps,
-                      int repeats) {
+double MeasureOrderedOffsets(Node* memory,
+                             const std::vector<std::size_t>& offsets, int steps,
+                             int repeats) {
   if (memory == nullptr || offsets.empty() || steps <= 0 || repeats <= 0) {
     throw std::invalid_argument(
         "Measurement requires a buffer, offsets, and positive step and repeat "
         "counts.");
   }
 
-  std::mt19937 random_order(42);
-
-  std::shuffle(offsets.begin(), offsets.end(), random_order);
   for (std::size_t i = 0; i < offsets.size(); ++i) {
     const std::size_t next_index = (i + 1) % offsets.size();
     memory[offsets[i] / sizeof(Node)].next =
@@ -79,6 +77,14 @@ double MeasureOffsets(Node* memory, std::vector<std::size_t> offsets, int steps,
 
   return MeasureRingLatency(memory + (offsets[0] / sizeof(Node)), steps,
                             repeats);
+}
+
+double MeasureOffsets(Node* memory, std::vector<std::size_t> offsets, int steps,
+                      int repeats, std::uint32_t seed) {
+  std::mt19937 random_order(seed);
+  std::shuffle(offsets.begin(), offsets.end(), random_order);
+
+  return MeasureOrderedOffsets(memory, offsets, steps, repeats);
 }
 
 }

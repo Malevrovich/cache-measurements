@@ -19,14 +19,20 @@ int main(int argc, char* argv[]) {
     cache_probe::Node* memory = buffer.data();
     cache_probe::PrepareMeasurements(memory);
 
-    const auto geometry = cache_probe::MeasureCacheGeometry(memory, debug);
+    if (debug) {
+      std::cerr << "experiment,bytes,n,trial,baseline_ns,control_ns,test_ns,"
+                   "relative_cost\n";
+    }
+
+    const auto line_size = cache_probe::MeasureCacheLineSize(memory, debug);
     const auto capacity_bytes =
-        geometry.associativity * geometry.conflict_stride;
-    const auto line_size = cache_probe::MeasureCacheLineSize(memory);
+        cache_probe::MeasureCacheCapacity(memory, line_size, debug);
+    const auto associativity = cache_probe::MeasureCacheAssociativity(
+        memory, capacity_bytes, line_size, debug);
 
     std::cout << "L1D capacity: " << capacity_bytes / 1024 << " KiB\n"
               << "L1 line size: " << line_size << " bytes\n"
-              << "Associativity: " << geometry.associativity << '\n';
+              << "Associativity: " << associativity << '\n';
 
     return 0;
   } catch (const std::exception& error) {
