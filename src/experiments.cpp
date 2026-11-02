@@ -11,7 +11,8 @@
 namespace cache_probe {
 namespace {
 
-constexpr double kTransitionThreshold = 1.5;
+constexpr double kConflictOnsetThreshold = 1.2;
+constexpr double kConflictConfirmationThreshold = 1.5;
 constexpr std::size_t kMaxConflictStride = 1024 * 1024;
 constexpr std::size_t kMaxConflictNodes = 64;
 constexpr int kConfirmingStrides = 3;
@@ -71,7 +72,7 @@ std::size_t RequiredMemoryBytes() {
   return std::max(conflict_bytes, line_bytes);
 }
 
-CacheGeometry MeasureCacheGeometry(Node* memory) {
+CacheGeometry MeasureCacheGeometry(Node* memory, bool debug) {
   constexpr std::size_t kFirstDiagnosticCount = 6;
   constexpr std::size_t kLastDiagnosticCount = 12;
   constexpr std::size_t kDiagnosticSamples =
@@ -80,12 +81,15 @@ CacheGeometry MeasureCacheGeometry(Node* memory) {
   CacheGeometry candidate{};
   int confirming_strides = 0;
 
-  std::cerr << "stride_bytes,n,control_ns,strided_ns,ratio\n";
+  if (debug) {
+    std::cerr << "stride_bytes,n,control_ns,strided_ns,ratio\n";
+  }
 
   for (std::size_t stride = sizeof(Node); stride <= kMaxConflictStride;
        stride *= 2) {
     std::array<double, kDiagnosticSamples> control_latencies{};
     std::array<double, kDiagnosticSamples> strided_latencies{};
+    std::size_t transition_start = 0;
     std::size_t first_conflicting_count = 0;
     bool previous_was_slow = false;
 
@@ -95,30 +99,42 @@ CacheGeometry MeasureCacheGeometry(Node* memory) {
       const double strided_latency =
           MeasureOffsets(memory, MakeOffsets(count, stride));
 
-      if (count >= kFirstDiagnosticCount && count <= kLastDiagnosticCount) {
+      if (debug && count >= kFirstDiagnosticCount &&
+          count <= kLastDiagnosticCount) {
         const auto index = count - kFirstDiagnosticCount;
         control_latencies[index] = control_latency;
         strided_latencies[index] = strided_latency;
       }
 
-      const bool is_slow =
-          strided_latency / control_latency > kTransitionThreshold;
+      const double ratio = strided_latency / control_latency;
+      if (ratio > kConflictOnsetThreshold) {
+        if (transition_start == 0) {
+          transition_start = count;
+        }
+      } else {
+        transition_start = 0;
+      }
+
+      const bool is_slow = ratio > kConflictConfirmationThreshold;
       if (first_conflicting_count == 0 && is_slow && previous_was_slow) {
-        first_conflicting_count = count - 1;
+        first_conflicting_count = transition_start;
       }
 
       previous_was_slow = is_slow;
 
-      if (first_conflicting_count != 0 && count >= kLastDiagnosticCount) {
+      if (first_conflicting_count != 0 &&
+          (!debug || count >= kLastDiagnosticCount)) {
         break;
       }
     }
 
-    for (std::size_t index = 0; index < kDiagnosticSamples; ++index) {
-      std::cerr << stride << ',' << index + kFirstDiagnosticCount << ','
-                << control_latencies[index] << ',' << strided_latencies[index]
-                << ',' << strided_latencies[index] / control_latencies[index]
-                << '\n';
+    if (debug) {
+      for (std::size_t index = 0; index < kDiagnosticSamples; ++index) {
+        std::cerr << stride << ',' << index + kFirstDiagnosticCount << ','
+                  << control_latencies[index] << ',' << strided_latencies[index]
+                  << ',' << strided_latencies[index] / control_latencies[index]
+                  << '\n';
+      }
     }
 
     if (first_conflicting_count < 2) {

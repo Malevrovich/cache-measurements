@@ -13,7 +13,7 @@ struct CacheGeometry {
 
 std::size_t RequiredMemoryBytes();
 
-CacheGeometry MeasureCacheGeometry(Node* memory);
+CacheGeometry MeasureCacheGeometry(Node* memory, bool debug = false);
 
 std::size_t MeasureCacheLineSize(Node* memory);
 
