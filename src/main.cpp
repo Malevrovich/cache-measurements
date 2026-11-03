@@ -24,7 +24,10 @@ int main(int argc, char* argv[]) {
                    "relative_cost\n";
     }
 
-    const auto line_size = cache_probe::MeasureCacheLineSize(memory, debug);
+    const auto estimated_capacity = cache_probe::MeasureCacheCapacity(
+        memory, sizeof(cache_probe::Node), debug);
+    const auto line_size =
+        cache_probe::MeasureCacheLineSize(memory, estimated_capacity, debug);
     const auto capacity_bytes =
         cache_probe::MeasureCacheCapacity(memory, line_size, debug);
     const auto associativity = cache_probe::MeasureCacheAssociativity(

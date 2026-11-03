@@ -24,8 +24,10 @@ constexpr std::size_t kMaxConflictNodes = 64;
 constexpr std::size_t kPatternTrials = 5;
 constexpr int kProbeSteps = 2097152;
 constexpr int kProbeRepeats = 3;
-constexpr std::size_t kLineRegionBytes = 4 * 1024 * 1024;
 constexpr std::size_t kLineTileBytes = 512;
+constexpr std::size_t kMinLineGroups = 1024;
+constexpr std::size_t kMaxLineRegionBytes =
+    kMaxCapacityBytes / (2 * sizeof(Node)) * kLineTileBytes;
 
 struct LatencyPair {
   double control;
@@ -53,11 +55,11 @@ LatencyPair MeasurePatternPair(Node* memory,
   return result;
 }
 
-double MeasureCapacityRatio(Node* memory, std::size_t bytes,
-                            std::size_t line_size, bool debug) {
+double MeasureCapacityRatio(Node* memory, std::size_t bytes, std::size_t stride,
+                            bool debug) {
   const auto control_offsets =
-      MakeOffsets(kControlRegionBytes / line_size, line_size);
-  const auto offsets = MakeOffsets(bytes / line_size, line_size);
+      MakeOffsets(kControlRegionBytes / stride, stride);
+  const auto offsets = MakeOffsets(bytes / stride, stride);
   std::array<LatencyPair, kPatternTrials> timings{};
   std::array<double, kPatternTrials> ratios{};
 
@@ -69,8 +71,10 @@ double MeasureCapacityRatio(Node* memory, std::size_t bytes,
   }
 
   if (debug) {
+    const char* experiment =
+        stride == sizeof(Node) ? "capacity-estimate" : "capacity";
     for (std::size_t trial = 0; trial < kPatternTrials; ++trial) {
-      std::cerr << "capacity," << bytes << ',' << offsets.size() << ','
+      std::cerr << experiment << ',' << bytes << ',' << offsets.size() << ','
                 << trial + 1 << ',' << timings[trial].control << ','
                 << timings[trial].control << ',' << timings[trial].measured
                 << ',' << ratios[trial] << '\n';
@@ -159,14 +163,14 @@ std::size_t FindConflictBoundary(Node* memory, std::size_t stride,
 
 std::size_t RequiredMemoryBytes() {
   const std::size_t conflict_bytes = kMaxCapacityBytes * kMaxConflictNodes;
-  return std::max(conflict_bytes, kLineRegionBytes);
+  return std::max(conflict_bytes, kMaxLineRegionBytes);
 }
 
-std::size_t MeasureCacheCapacity(Node* memory, std::size_t line_size,
-                                 bool debug) {
-  if (line_size < sizeof(Node) || line_size > kCapacityResolutionBytes ||
-      kCapacityResolutionBytes % line_size != 0) {
-    throw std::invalid_argument("Invalid line size for the capacity scan.");
+std::size_t MeasureCacheCapacity(Node* memory, std::size_t stride, bool debug) {
+  if (stride < sizeof(Node) || stride > kCapacityResolutionBytes ||
+      kCapacityResolutionBytes % stride != 0) {
+    throw std::invalid_argument(
+        "Invalid sampling stride for the capacity scan.");
   }
 
   std::size_t boundary_bytes = 0;
@@ -174,7 +178,7 @@ std::size_t MeasureCacheCapacity(Node* memory, std::size_t line_size,
 
   for (std::size_t bytes = kCapacityStepBytes; bytes <= kMaxCapacityBytes;
        bytes += kCapacityStepBytes) {
-    if (MeasureCapacityRatio(memory, bytes, line_size, debug) >
+    if (MeasureCapacityRatio(memory, bytes, stride, debug) >
         kCapacityThreshold) {
       if (consecutive_slow == 0) {
         boundary_bytes = bytes - kCapacityStepBytes;
@@ -186,7 +190,7 @@ std::size_t MeasureCacheCapacity(Node* memory, std::size_t line_size,
         while (slow_bytes - fast_bytes > kCapacityResolutionBytes) {
           const std::size_t middle_bytes =
               fast_bytes + (slow_bytes - fast_bytes) / 2;
-          if (MeasureCapacityRatio(memory, middle_bytes, line_size, debug) >
+          if (MeasureCapacityRatio(memory, middle_bytes, stride, debug) >
               kCapacityThreshold) {
             slow_bytes = middle_bytes;
           } else {
@@ -250,11 +254,19 @@ std::size_t MeasureCacheAssociativity(Node* memory, std::size_t capacity_bytes,
       "Could not reproduce the L1 associativity boundary.");
 }
 
-std::size_t MeasureCacheLineSize(Node* memory, bool debug) {
-  constexpr std::array<std::size_t, 6> kOffsets = {8, 16, 32, 64, 128, 256};
-  constexpr std::size_t kGroupCount = kLineRegionBytes / kLineTileBytes;
+std::size_t MeasureCacheLineSize(Node* memory, std::size_t estimated_capacity,
+                                 bool debug) {
+  if (estimated_capacity < kControlRegionBytes ||
+      estimated_capacity > kMaxCapacityBytes) {
+    throw std::invalid_argument(
+        "Invalid capacity estimate for the line-size scan.");
+  }
 
-  std::vector<std::size_t> groups(kGroupCount);
+  constexpr std::array<std::size_t, 6> kOffsets = {8, 16, 32, 64, 128, 256};
+  const std::size_t group_count =
+      std::max(kMinLineGroups, estimated_capacity / (2 * sizeof(Node)));
+
+  std::vector<std::size_t> groups(group_count);
   std::iota(groups.begin(), groups.end(), 0);
   std::array<std::size_t, kOffsets.size()> tests{};
   std::iota(tests.begin(), tests.end(), 0);
@@ -267,7 +279,7 @@ std::size_t MeasureCacheLineSize(Node* memory, bool debug) {
 
     for (const auto test : tests) {
       std::vector<std::size_t> offsets;
-      offsets.reserve(kGroupCount * 2);
+      offsets.reserve(group_count * 2);
       for (const auto group : groups) {
         offsets.push_back(group * kLineTileBytes);
         offsets.push_back(group * kLineTileBytes + kOffsets[test]);
@@ -283,7 +295,7 @@ std::size_t MeasureCacheLineSize(Node* memory, bool debug) {
     if (debug) {
       for (std::size_t trial = 0; trial < kPatternTrials; ++trial) {
         const double baseline = timings[0][trial];
-        std::cerr << "line," << kOffsets[test] << ',' << kGroupCount * 2 << ','
+        std::cerr << "line," << kOffsets[test] << ',' << group_count * 2 << ','
                   << trial + 1 << ',' << baseline << ',' << baseline << ','
                   << timings[test][trial] << ','
                   << timings[test][trial] / baseline << '\n';
