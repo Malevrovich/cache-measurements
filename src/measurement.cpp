@@ -44,7 +44,7 @@ double MeasureRingLatency(Node* current_node, int steps, int repeats) {
 
 void PrepareMeasurements(Node* memory) {
   const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
 
   while (std::chrono::steady_clock::now() < deadline) {
     MeasureOffsets(memory, MakeOffsets(128, sizeof(Node)));
